@@ -11,22 +11,22 @@ import java.util.Map;
 @Data
 public class PerformanceTestRequest {
 
-    // ── Target API — user provides fully resolved values, no placeholders ─────
+    // ── Target — one of these two approaches ─────────────────────────────────
 
-    @NotBlank(message = "url is required")
+    // Option A: reference a saved API (preferred — reuse across multiple runs)
+    private Long apiId;
+
+    // Option B: provide inline (quick one-off test, no need to save)
     private String url;
-
-    @NotBlank(message = "method is required (GET, POST, PUT, DELETE, PATCH)")
     private String method = "GET";
-
-    // Optional — key/value pairs e.g. {"Content-Type": "application/json", "Authorization": "Bearer ..."}
-    private Map<String, String> headers;
-
-    // Optional — raw request body string
+    private java.util.Map<String, String> headers;
     private String body;
 
-    // Optional label — shown in history/results so you know what was tested
-    private String name;
+    // Multiple payloads for round-robin across virtual users.
+    // Works with both apiId and inline. Overrides the saved API's payloadList if set here.
+    private java.util.List<String> payloadList;
+
+    private String name; // label shown in history
 
     // ── Test type ─────────────────────────────────────────────────────────────
 

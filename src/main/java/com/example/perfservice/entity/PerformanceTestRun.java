@@ -27,11 +27,19 @@ public class PerformanceTestRun {
     @Column(nullable = false)
     private String resolvedMethod;
 
+    // Optional reference to the saved API this run was triggered from
+    private Long apiId;
+
     @Column(columnDefinition = "TEXT")
     private String resolvedHeadersJson;
 
     @Column(columnDefinition = "TEXT")
     private String resolvedBodyJson;
+
+    // Snapshot of the payload list used — null means single body (resolvedBodyJson),
+    // non-null means round-robin was active with these payloads
+    @Column(columnDefinition = "TEXT")
+    private String payloadListJson;
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
