@@ -12,20 +12,18 @@ spring:
   jpa:
     hibernate:
       ddl-auto: none
-      dialect: org.hibernate.dialect.PostgreSQLDialect
     show-sql: false
     open-in-view: false
-    properties:
-      hibernate.dialect: org.hibernate.dialect.PostgreSQLDialect
 
-# URL of the main flow-engine app — used to fetch step config at test start
-flow-engine:
-  base-url: ${FLOW_ENGINE_URL:http://localhost:8060}
-  # Internal API key — set the same value in both services via env var
-  internal-api-key: ${INTERNAL_API_KEY:internal_api_key_1234567890}
+# JWT secret — must be the SAME value as app.jwt.secret in the main app.
+# Set JWT_SECRET env var identically on both services.
+# Industry standard: both services trust the same token issuer (main app),
+# so a token the frontend gets from main app is valid on perf service too —
+# no separate auth server, no internal key needed for user-facing requests.
+app:
+  jwt:
+    secret: ${JWT_SECRET:flowengine-jwt-secret-key-change-in-production-min-32-chars}
 
-# How many virtual users can be running simultaneously across all tests.
-# Each virtual user is one thread — keep this below your deployment's thread limit.
 perf:
   max-total-virtual-users: ${MAX_VIRTUAL_USERS:200}
 

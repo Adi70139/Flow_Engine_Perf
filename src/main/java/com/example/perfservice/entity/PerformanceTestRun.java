@@ -14,6 +14,9 @@ public class PerformanceTestRun {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    @Column(nullable = false)
+    private Long userId;  // from JWT claim — no User table needed in this service
+
     // User-provided label for this test — no coupling to the main app's step IDs
     @Column(nullable = false)
     private String name;

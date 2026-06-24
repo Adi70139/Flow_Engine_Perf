@@ -8,28 +8,15 @@ import com.example.perfservice.repository.PerformanceTestSampleRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import okhttp3.MediaType;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.RequestBody;
-import okhttp3.Response;
+import okhttp3.*;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -47,10 +34,11 @@ public class PerformanceTestService {
     private final Map<Long, List<SseEmitter>> emitters = new ConcurrentHashMap<>();
     private final Map<Long, AtomicBoolean> cancelFlags = new ConcurrentHashMap<>();
 
-    // -- Public API ------------------------------------------------------------
+    // ── Public API ────────────────────────────────────────────────────────────
 
     public PerformanceTestRun start(PerformanceTestRequest request) {
-        PerformanceTestRun run = buildRun(request);
+        Long userId = com.example.perfservice.security.SecurityUtils.requireUserId();
+        PerformanceTestRun run = buildRun(request, userId);
         run = runRepository.save(run);
 
         final Long runId = run.getId();
@@ -87,42 +75,38 @@ public class PerformanceTestService {
     }
 
     public void cancel(Long runId) {
+        Long userId = com.example.perfservice.security.SecurityUtils.requireUserId();
+        // Verify ownership before allowing cancel
+        runRepository.findByIdAndUserId(runId, userId)
+                .orElseThrow(() -> new IllegalArgumentException("Run not found: " + runId));
         AtomicBoolean flag = cancelFlags.get(runId);
         if (flag == null) throw new IllegalStateException("No active test with runId: " + runId);
         flag.set(true);
-        log.info("[PerfTest] Cancel requested for runId={}", runId);
+        log.info("[PerfTest] Cancel requested for runId={} by userId={}", runId, userId);
     }
 
     public PerformanceTestRun getResult(Long runId) {
-        return runRepository.findById(runId)
+        Long userId = com.example.perfservice.security.SecurityUtils.requireUserId();
+        return runRepository.findByIdAndUserId(runId, userId)
                 .orElseThrow(() -> new IllegalArgumentException("Run not found: " + runId));
     }
 
     public List<PerformanceTestSample> getSamples(Long runId) {
+        Long userId = com.example.perfservice.security.SecurityUtils.requireUserId();
+        // ownership check before loading samples
+        runRepository.findByIdAndUserId(runId, userId)
+                .orElseThrow(() -> new IllegalArgumentException("Run not found: " + runId));
         return sampleRepository.findByRunIdOrderByFiredAt(runId);
     }
 
     public List<PerformanceTestRun> getHistory() {
-        return runRepository.findAllByOrderByStartedAtDesc();
+        Long userId = com.example.perfservice.security.SecurityUtils.requireUserId();
+        return runRepository.findByUserIdOrderByStartedAtDesc(userId);
     }
 
-    public SseEmitter subscribe(Long runId) {
-        SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
-        emitters.computeIfAbsent(runId, k -> new CopyOnWriteArrayList<>()).add(emitter);
-        emitter.onCompletion(() -> removeEmitter(runId, emitter));
-        emitter.onTimeout(() -> removeEmitter(runId, emitter));
-        emitter.onError(e -> removeEmitter(runId, emitter));
-        runRepository.findById(runId).ifPresent(run -> {
-            try {
-                emitter.send(SseEmitter.event().name("status").data(run.getStatus()));
-            } catch (Exception ignored) {
-            }
-        });
-        return emitter;
-    }
-
-    private PerformanceTestRun buildRun(PerformanceTestRequest req) {
+    private PerformanceTestRun buildRun(PerformanceTestRequest req, Long userId) {
         PerformanceTestRun run = new PerformanceTestRun();
+        run.setUserId(userId);
         run.setName(req.getName() != null ? req.getName() : req.getMethod() + " " + req.getUrl());
         run.setResolvedUrl(req.getUrl());
         run.setResolvedMethod(req.getMethod().toUpperCase());
@@ -148,7 +132,23 @@ public class PerformanceTestService {
         return run;
     }
 
-    // -- Test types ------------------------------------------------------------
+    public SseEmitter subscribe(Long runId) {
+        Long userId = com.example.perfservice.security.SecurityUtils.requireUserId();
+        runRepository.findByIdAndUserId(runId, userId)
+                .orElseThrow(() -> new IllegalArgumentException("Run not found: " + runId));
+        SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
+        emitters.computeIfAbsent(runId, k -> new CopyOnWriteArrayList<>()).add(emitter);
+        emitter.onCompletion(() -> removeEmitter(runId, emitter));
+        emitter.onTimeout(() -> removeEmitter(runId, emitter));
+        emitter.onError(e -> removeEmitter(runId, emitter));
+        runRepository.findByIdAndUserId(runId, userId).ifPresent(run -> {
+            try { emitter.send(SseEmitter.event().name("status").data(run.getStatus())); }
+            catch (Exception ignored) {}
+        });
+        return emitter;
+    }
+
+    // ── Test types ────────────────────────────────────────────────────────────
 
     /**
      * LOAD: N virtual users fire requests back-to-back for durationSeconds.
@@ -162,7 +162,7 @@ public class PerformanceTestService {
 
     /**
      * STRESS: Start at virtualUsers, add stressRampStep users every stressRampIntervalSeconds.
-     * Stop when error rate > 5%. Key output: stressBreakingPointUsers - the user ceiling.
+     * Stop when error rate > 5%. Key output: stressBreakingPointUsers — the user ceiling.
      */
     private void runStress(PerformanceTestRun run, PerformanceTestRequest req) throws Exception {
         log.info("[PerfTest] STRESS runId={} startUsers={} rampStep={} interval={}s",
@@ -176,7 +176,7 @@ public class PerformanceTestService {
         AtomicBoolean cancelled = cancelFlags.get(run.getId());
 
         while (!cancelled.get() && (System.currentTimeMillis() - startTime) < maxMs) {
-            log.info("[PerfTest] STRESS runId={} -> {} users", run.getId(), currentUsers);
+            log.info("[PerfTest] STRESS runId={} → {} users", run.getId(), currentUsers);
             broadcastEvent(run.getId(), "ramp", Map.of("users", currentUsers));
 
             List<PerformanceTestSample> levelSamples =
@@ -186,13 +186,13 @@ public class PerformanceTestService {
             long failed = levelSamples.stream().filter(s -> !s.getSuccess()).count();
             double errorRate = total > 0 ? (double) failed / total : 0;
 
-            log.info("[PerfTest] STRESS runId={} users={} errorRate={}%%",
-                    run.getId(), currentUsers, String.format("%.1f", errorRate * 100));
+            log.info("[PerfTest] STRESS runId={} users={} errorRate={:.1f}%",
+                    run.getId(), currentUsers, errorRate * 100);
 
             if (errorRate >= STRESS_ERROR_THRESHOLD) {
                 breakingPoint = currentUsers;
-                log.info("[PerfTest] STRESS breaking point: {} users ({}% error rate)",
-                        currentUsers, String.format("%.1f", errorRate * 100));
+                log.info("[PerfTest] STRESS breaking point: {} users ({:.1f}% error rate)",
+                        currentUsers, errorRate * 100);
                 broadcastEvent(run.getId(), "breaking_point",
                         Map.of("users", currentUsers, "errorRatePct", errorRate * 100));
                 break;
@@ -210,8 +210,8 @@ public class PerformanceTestService {
     }
 
     /**
-     * SPIKE: warmup at base users -> burst to spikeUsers -> cooldown back to base.
-     * Key output: compare p99 during cooldown vs warmup - good API = they converge back.
+     * SPIKE: warmup at base users → burst to spikeUsers → cooldown back to base.
+     * Key output: compare p99 during cooldown vs warmup — good API = they converge back.
      */
     private void runSpike(PerformanceTestRun run, PerformanceTestRequest req) throws Exception {
         log.info("[PerfTest] SPIKE runId={} base={} spike={}",
@@ -229,7 +229,7 @@ public class PerformanceTestService {
 
     /**
      * SOAK: sustained load for soakDurationSeconds. Emits window stats every 30s so you can
-     * chart latency drift over time - rising p99 = memory leak or connection pool exhaustion.
+     * chart latency drift over time — rising p99 = memory leak or connection pool exhaustion.
      */
     private void runSoak(PerformanceTestRun run, PerformanceTestRequest req) throws Exception {
         log.info("[PerfTest] SOAK runId={} users={} duration={}s",
@@ -257,7 +257,7 @@ public class PerformanceTestService {
         }
     }
 
-    // -- Core concurrent runner ------------------------------------------------
+    // ── Core concurrent runner ─────────────────────────────────────────────────
 
     private void runConcurrently(PerformanceTestRun run, int users, long durationMs) throws Exception {
         runConcurrentlyCollect(run, users, durationMs);
@@ -284,9 +284,7 @@ public class PerformanceTestService {
                     allSamples.add(sample);
                     pendingInsert.add(sample);
                     long total = totalRequests.incrementAndGet();
-                    if (sample.getSuccess()) {
-                        successCount.incrementAndGet();
-                    }
+                    if (sample.getSuccess()) successCount.incrementAndGet();
 
                     // Batch insert every 100 samples
                     if (pendingInsert.size() >= 100) {
@@ -337,8 +335,7 @@ public class PerformanceTestService {
                 try {
                     Map<?, ?> headers = objectMapper.readValue(run.getResolvedHeadersJson(), Map.class);
                     headers.forEach((k, v) -> rb.header(String.valueOf(k), String.valueOf(v)));
-                } catch (Exception ignored) {
-                }
+                } catch (Exception ignored) {}
             }
 
             // Build body
@@ -370,7 +367,7 @@ public class PerformanceTestService {
         return sample;
     }
 
-    // -- Stats -----------------------------------------------------------------
+    // ── Stats ─────────────────────────────────────────────────────────────────
 
     private void finalizeRun(Long runId) {
         try {
@@ -447,20 +444,16 @@ public class PerformanceTestService {
     }
 
     private double percentile(List<Long> sorted, int pct) {
-        if (sorted.isEmpty()) {
-            return 0;
-        }
+        if (sorted.isEmpty()) return 0;
         int index = (int) Math.ceil(pct / 100.0 * sorted.size()) - 1;
         return sorted.get(Math.max(0, Math.min(index, sorted.size() - 1)));
     }
 
-    // -- SSE -------------------------------------------------------------------
+    // ── SSE ───────────────────────────────────────────────────────────────────
 
     private void broadcastEvent(Long runId, String eventName, Object data) {
         List<SseEmitter> list = emitters.get(runId);
-        if (list == null || list.isEmpty()) {
-            return;
-        }
+        if (list == null || list.isEmpty()) return;
         List<SseEmitter> dead = new ArrayList<>();
         for (SseEmitter emitter : list) {
             try {
@@ -475,21 +468,12 @@ public class PerformanceTestService {
 
     private void closeEmitters(Long runId) {
         List<SseEmitter> list = emitters.remove(runId);
-        if (list != null) {
-            list.forEach(e -> {
-                try {
-                    e.complete();
-                } catch (Exception ignored) {
-                }
-            });
-        }
+        if (list != null) list.forEach(e -> { try { e.complete(); } catch (Exception ignored) {} });
     }
 
     private void removeEmitter(Long runId, SseEmitter emitter) {
         List<SseEmitter> list = emitters.get(runId);
-        if (list != null) {
-            list.remove(emitter);
-        }
+        if (list != null) list.remove(emitter);
     }
 
     private void updateStatus(Long runId, String status) {
@@ -498,5 +482,5 @@ public class PerformanceTestService {
             runRepository.save(r);
         });
     }
-}
 
+}

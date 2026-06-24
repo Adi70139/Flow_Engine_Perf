@@ -50,6 +50,7 @@ public class PerformanceRating {
                     "%.1f%% of requests failed — fix errors before drawing performance conclusions. " +
                             "Check errorSummary for the status code breakdown.", r.errorRatePct);
             r.issues.add(String.format("%.1f%% error rate (acceptable threshold: <5%%)", r.errorRatePct));
+            r.errorSummary = run.getErrorSummary();
             return r;
         }
 
