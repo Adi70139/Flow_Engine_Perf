@@ -1,0 +1,23 @@
+services:
+  perf-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: perf-service
+
+    ports:
+      - "8070:8070"
+
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://host.docker.internal:5433/flow_engine
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+
+      JWT_SECRET: flowengine-jwt-secret-key-change-in-production-min-32-chars
+
+      FLOW_ENGINE_URL: http://host.docker.internal:8060
+
+      MAX_VIRTUAL_USERS: 200
+
+    restart: unless-stopped
