@@ -25,6 +25,7 @@ public class PerformanceTestService {
 
     private final PerformanceTestRunRepository runRepository;
     private final PerformanceTestSampleRepository sampleRepository;
+    private final com.example.perfservice.repository.PerformanceTestApiRepository apiRepository;
     private final OkHttpClient okHttpClient;
     private final ObjectMapper objectMapper;
 
@@ -38,7 +39,40 @@ public class PerformanceTestService {
 
     public PerformanceTestRun start(PerformanceTestRequest request) {
         Long userId = com.example.perfservice.security.SecurityUtils.requireUserId();
-        PerformanceTestRun run = buildRun(request, userId);
+
+        // Resolve API config — from saved API or inline fields
+        String url, method, headersJson, bodyJson, payloadListJson;
+        Long apiId = null;
+
+        if (request.getApiId() != null) {
+            com.example.perfservice.entity.PerformanceTestApi api =
+                    apiRepository.findByIdAndUserId(request.getApiId(), userId)
+                            .orElseThrow(() -> new IllegalArgumentException(
+                                    "API not found: " + request.getApiId()));
+            url          = api.getUrl();
+            method       = api.getMethod();
+            headersJson  = api.getHeadersJson();
+            bodyJson     = api.getBodyJson();
+            // Request-level payloadList overrides the saved API's — lets you test
+            // the same endpoint with different data sets without editing the saved API
+            payloadListJson = resolvePayloadList(request, api);
+            apiId = api.getId();
+            log.info("[PerfTest] Using saved API '{}' (id={}) for run", api.getName(), apiId);
+        } else {
+            if (request.getUrl() == null || request.getUrl().isBlank()) {
+                throw new IllegalArgumentException("Either apiId or url must be provided");
+            }
+            url    = request.getUrl();
+            method = request.getMethod() != null ? request.getMethod().toUpperCase() : "GET";
+            try {
+                headersJson = request.getHeaders() != null
+                        ? objectMapper.writeValueAsString(request.getHeaders()) : null;
+            } catch (Exception e) { headersJson = null; }
+            bodyJson        = request.getBody();
+            payloadListJson = resolvePayloadList(request, null);
+        }
+
+        PerformanceTestRun run = buildRun(request, userId, apiId, url, method, headersJson, bodyJson, payloadListJson);
         run = runRepository.save(run);
 
         final Long runId = run.getId();
@@ -91,6 +125,13 @@ public class PerformanceTestService {
                 .orElseThrow(() -> new IllegalArgumentException("Run not found: " + runId));
     }
 
+    public List<java.util.Map<String, Object>> getUserStats(Long runId) {
+        Long userId = com.example.perfservice.security.SecurityUtils.requireUserId();
+        runRepository.findByIdAndUserId(runId, userId)
+                .orElseThrow(() -> new IllegalArgumentException("Run not found: " + runId));
+        return sampleRepository.getUserStats(runId);
+    }
+
     public List<PerformanceTestSample> getSamples(Long runId) {
         Long userId = com.example.perfservice.security.SecurityUtils.requireUserId();
         // ownership check before loading samples
@@ -104,19 +145,18 @@ public class PerformanceTestService {
         return runRepository.findByUserIdOrderByStartedAtDesc(userId);
     }
 
-    private PerformanceTestRun buildRun(PerformanceTestRequest req, Long userId) {
+    private PerformanceTestRun buildRun(PerformanceTestRequest req, Long userId,
+                                        Long apiId, String url, String method,
+                                        String headersJson, String bodyJson, String payloadListJson) {
         PerformanceTestRun run = new PerformanceTestRun();
         run.setUserId(userId);
-        run.setName(req.getName() != null ? req.getName() : req.getMethod() + " " + req.getUrl());
-        run.setResolvedUrl(req.getUrl());
-        run.setResolvedMethod(req.getMethod().toUpperCase());
-        try {
-            run.setResolvedHeadersJson(
-                    req.getHeaders() != null ? objectMapper.writeValueAsString(req.getHeaders()) : null);
-        } catch (Exception e) {
-            run.setResolvedHeadersJson(null);
-        }
-        run.setResolvedBodyJson(req.getBody());
+        run.setApiId(apiId);
+        run.setName(req.getName() != null ? req.getName() : method + " " + url);
+        run.setResolvedUrl(url);
+        run.setResolvedMethod(method);
+        run.setResolvedHeadersJson(headersJson);
+        run.setResolvedBodyJson(bodyJson);
+        run.setPayloadListJson(payloadListJson);
         run.setTestType(req.getTestType());
         run.setVirtualUsers(req.getVirtualUsers());
         run.setDurationSeconds(req.getDurationSeconds());
@@ -130,6 +170,22 @@ public class PerformanceTestService {
         run.setStatus("PENDING");
         run.setStartedAt(LocalDateTime.now());
         return run;
+    }
+
+    /**
+     * Resolves which payload list to use. Request-level payloadList takes precedence
+     * over the saved API's payloadList — lets you override without editing the saved API.
+     */
+    private String resolvePayloadList(PerformanceTestRequest request,
+                                      com.example.perfservice.entity.PerformanceTestApi api) {
+        // Request-level overrides saved API
+        if (request.getPayloadList() != null && !request.getPayloadList().isEmpty()) {
+            try { return objectMapper.writeValueAsString(request.getPayloadList()); }
+            catch (Exception e) { return null; }
+        }
+        // Fall back to saved API's payload list
+        if (api != null) return api.getPayloadListJson();
+        return null;
     }
 
     public SseEmitter subscribe(Long runId) {
@@ -338,13 +394,27 @@ public class PerformanceTestService {
                 } catch (Exception ignored) {}
             }
 
-            // Build body
+            // Build body — round-robin from payloadList if present, otherwise single body.
+            // userId - 1 gives 0-based index; modulo cycles when payloads < users.
+            // e.g. 5 users, 2 payloads: user1→[0], user2→[1], user3→[0], user4→[1], user5→[0]
             String method = run.getResolvedMethod().toUpperCase();
+            String bodyToSend = run.getResolvedBodyJson();
+            if (run.getPayloadListJson() != null && !run.getPayloadListJson().isBlank()) {
+                try {
+                    List<String> payloads = objectMapper.readValue(
+                            run.getPayloadListJson(),
+                            new com.fasterxml.jackson.core.type.TypeReference<List<String>>() {});
+                    if (!payloads.isEmpty()) {
+                        bodyToSend = payloads.get((userId - 1) % payloads.size());
+                    }
+                } catch (Exception e) {
+                    log.warn("[PerfTest] Failed to parse payloadList for runId={}, using default body", run.getId());
+                }
+            }
+
             RequestBody requestBody = null;
-            if (run.getResolvedBodyJson() != null
-                    && !run.getResolvedBodyJson().isBlank()
-                    && !method.equals("GET")) {
-                requestBody = RequestBody.create(run.getResolvedBodyJson(), JSON_MEDIA);
+            if (bodyToSend != null && !bodyToSend.isBlank() && !method.equals("GET")) {
+                requestBody = RequestBody.create(bodyToSend, JSON_MEDIA);
             }
             rb.method(method, requestBody);
 

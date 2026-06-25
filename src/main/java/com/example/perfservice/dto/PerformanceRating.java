@@ -24,7 +24,6 @@ public class PerformanceRating {
     private String summary;        // one-line verdict
     private List<String> issues = new ArrayList<>();
     private List<String> strengths = new ArrayList<>();
-    private String errorSummary; // JSON: {statusCode: count} e.g. {"401": 250, "0": 9}
 
     // Raw numbers echoed back for convenience
     private double errorRatePct;
@@ -50,7 +49,6 @@ public class PerformanceRating {
                     "%.1f%% of requests failed — fix errors before drawing performance conclusions. " +
                             "Check errorSummary for the status code breakdown.", r.errorRatePct);
             r.issues.add(String.format("%.1f%% error rate (acceptable threshold: <5%%)", r.errorRatePct));
-            r.errorSummary = run.getErrorSummary();
             return r;
         }
 
@@ -118,7 +116,14 @@ public class PerformanceRating {
             r.summary = "API is struggling under this load — multiple significant issues detected.";
         }
 
-        r.errorSummary = run.getErrorSummary();
+        // High p99/p95 ratio on its own can cause rating to vary between runs
+        // if the spike is intermittent — surface this explicitly so the user
+        // understands why they might see GOOD one run and NEEDS_WORK the next.
+        if (tailRatio > 2.0) {
+            r.summary += " Note: high p99/p95 ratio (" + String.format("%.1f", tailRatio) + "x) means " +
+                    "tail latency is intermittent — run 3-5 times to establish a stable baseline.";
+        }
+
         return r;
     }
 }

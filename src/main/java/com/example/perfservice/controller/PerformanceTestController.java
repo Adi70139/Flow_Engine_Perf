@@ -58,6 +58,15 @@ public class PerformanceTestController {
         return PerformanceRating.evaluate(run);
     }
 
+    @GetMapping("/{runId}/user-stats")
+    @Operation(summary = "Per-virtual-user breakdown",
+            description = "Shows how many requests each virtual user made, their success/fail count, " +
+                    "and latency. Useful with payloadList runs to confirm each user's credentials " +
+                    "actually worked and no single user dominated the load.")
+    public List<java.util.Map<String, Object>> getUserStats(@PathVariable Long runId) {
+        return performanceTestService.getUserStats(runId);
+    }
+
     @GetMapping("/{runId}/samples")
     @Operation(summary = "Per-request latency samples — use for timeline chart")
     public List<PerformanceTestSample> getSamples(@PathVariable Long runId) {
