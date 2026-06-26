@@ -6,6 +6,7 @@ import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.security.Keys;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.InitializingBean;
 import org.springframework.stereotype.Component;
 
 import javax.crypto.SecretKey;
@@ -19,10 +20,20 @@ import java.nio.charset.StandardCharsets;
  */
 @Slf4j
 @Component
-public class JwtUtil {
+public class JwtUtil implements InitializingBean {
 
-    @Value("${app.jwt.secret:flowengine-jwt-secret-key-change-in-production-min-32-chars}")
+    @Value("${app.jwt.secret:}")
     private String secret;
+
+    @Override
+    public void afterPropertiesSet() {
+        if (secret == null || secret.isBlank()) {
+            throw new IllegalStateException("JWT secret is empty. Set JWT_SECRET (or JWT) env var.");
+        }
+        if (secret.getBytes(StandardCharsets.UTF_8).length < 32) {
+            throw new IllegalStateException("JWT secret must be at least 32 bytes for HS256.");
+        }
+    }
 
     private SecretKey key() {
         return Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
