@@ -41,6 +41,10 @@ public class PerformanceTestRun {
     @Column(columnDefinition = "TEXT")
     private String payloadListJson;
 
+    // Snapshot of the prerequisite chain used — null means no prereqs
+    @Column(columnDefinition = "TEXT")
+    private String prerequisiteChainJson;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     private PerformanceTestType testType;

@@ -1,10 +1,12 @@
 package com.example.perfservice.service;
 
 import com.example.perfservice.dto.PerformanceTestRequest;
+import com.example.perfservice.dto.PrerequisiteStep;
 import com.example.perfservice.entity.PerformanceTestRun;
 import com.example.perfservice.entity.PerformanceTestSample;
 import com.example.perfservice.repository.PerformanceTestRunRepository;
 import com.example.perfservice.repository.PerformanceTestSampleRepository;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -37,11 +39,11 @@ public class PerformanceTestService {
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    public PerformanceTestRun start(PerformanceTestRequest request) {
+    public PerformanceTestRun start(PerformanceTestRequest request) throws JsonProcessingException {
         Long userId = com.example.perfservice.security.SecurityUtils.requireUserId();
 
         // Resolve API config — from saved API or inline fields
-        String url, method, headersJson, bodyJson, payloadListJson;
+        String url, method, headersJson, bodyJson, payloadListJson, prerequisiteChainJson;
         Long apiId = null;
 
         if (request.getApiId() != null) {
@@ -56,6 +58,10 @@ public class PerformanceTestService {
             // Request-level payloadList overrides the saved API's — lets you test
             // the same endpoint with different data sets without editing the saved API
             payloadListJson = resolvePayloadList(request, api);
+            // Snapshot the prereq chain — request-level override takes precedence over saved API
+            String reqChain = request.getPrerequisiteChain() != null && !request.getPrerequisiteChain().isEmpty()
+                    ? objectMapper.writeValueAsString(request.getPrerequisiteChain()) : null;
+            prerequisiteChainJson = reqChain != null ? reqChain : api.getPrerequisiteChainJson();
             apiId = api.getId();
             log.info("[PerfTest] Using saved API '{}' (id={}) for run", api.getName(), apiId);
         } else {
@@ -70,9 +76,12 @@ public class PerformanceTestService {
             } catch (Exception e) { headersJson = null; }
             bodyJson        = request.getBody();
             payloadListJson = resolvePayloadList(request, null);
+            prerequisiteChainJson = request.getPrerequisiteChain() != null && !request.getPrerequisiteChain().isEmpty()
+                    ? objectMapper.writeValueAsString(request.getPrerequisiteChain()) : null;
         }
 
-        PerformanceTestRun run = buildRun(request, userId, apiId, url, method, headersJson, bodyJson, payloadListJson);
+        PerformanceTestRun run = buildRun(request, userId, apiId, url, method,
+                headersJson, bodyJson, payloadListJson, prerequisiteChainJson);
         run = runRepository.save(run);
 
         final Long runId = run.getId();
@@ -147,7 +156,8 @@ public class PerformanceTestService {
 
     private PerformanceTestRun buildRun(PerformanceTestRequest req, Long userId,
                                         Long apiId, String url, String method,
-                                        String headersJson, String bodyJson, String payloadListJson) {
+                                        String headersJson, String bodyJson,
+                                        String payloadListJson, String prerequisiteChainJson) {
         PerformanceTestRun run = new PerformanceTestRun();
         run.setUserId(userId);
         run.setApiId(apiId);
@@ -157,6 +167,7 @@ public class PerformanceTestService {
         run.setResolvedHeadersJson(headersJson);
         run.setResolvedBodyJson(bodyJson);
         run.setPayloadListJson(payloadListJson);
+        run.setPrerequisiteChainJson(prerequisiteChainJson);
         run.setTestType(req.getTestType());
         run.setVirtualUsers(req.getVirtualUsers());
         run.setDurationSeconds(req.getDurationSeconds());
@@ -329,6 +340,9 @@ public class PerformanceTestService {
         List<PerformanceTestSample> allSamples = new CopyOnWriteArrayList<>();
         List<PerformanceTestSample> pendingInsert = new CopyOnWriteArrayList<>();
 
+        // Parse prerequisite chain once — shared read-only across all threads
+        List<PrerequisiteStep> prereqChain = parsePrereqChain(run.getPrerequisiteChainJson());
+
         ExecutorService pool = Executors.newFixedThreadPool(users);
         List<Future<?>> futures = new ArrayList<>();
 
@@ -336,20 +350,41 @@ public class PerformanceTestService {
             final int userId = u;
             futures.add(pool.submit(() -> {
                 while (System.currentTimeMillis() < deadline && !cancelled.get()) {
-                    PerformanceTestSample sample = fireRequest(run, userId, users);
+
+                    // Each virtual user runs its own prereq chain to get fresh tokens/session data.
+                    // Map of captured values: placeholder name → resolved value
+                    Map<String, String> captures = new java.util.LinkedHashMap<>();
+                    boolean prereqFailed = false;
+
+                    if (!prereqChain.isEmpty()) {
+                        for (PrerequisiteStep prereq : prereqChain) {
+                            PrerequisiteResult pr = runPrerequisite(prereq, userId, captures, run.getUserId());
+                            if (!pr.success()) {
+                                log.warn("[PerfTest] runId={} VU={} prereq '{}' failed: {} — skipping this iteration",
+                                        run.getId(), userId, prereq.getName(), pr.errorDetail());
+                                prereqFailed = true;
+                                break;
+                            }
+                            // Merge captured values — available to subsequent prereqs and target
+                            captures.putAll(pr.captures());
+                        }
+                    }
+
+                    if (prereqFailed) continue; // don't record a sample, just retry the loop
+
+                    // Fire the target request with captures injected as placeholders
+                    PerformanceTestSample sample = fireRequest(run, userId, users, captures);
                     allSamples.add(sample);
                     pendingInsert.add(sample);
                     long total = totalRequests.incrementAndGet();
                     if (sample.getSuccess()) successCount.incrementAndGet();
 
-                    // Batch insert every 100 samples
                     if (pendingInsert.size() >= 100) {
                         List<PerformanceTestSample> batch = new ArrayList<>(pendingInsert);
                         pendingInsert.clear();
                         sampleRepository.saveAll(batch);
                     }
 
-                    // Broadcast progress every 50 requests
                     if (total % 50 == 0) {
                         double elapsedSec = (System.currentTimeMillis() - testStart) / 1000.0;
                         broadcastEvent(run.getId(), "progress", Map.of(
@@ -367,15 +402,126 @@ public class PerformanceTestService {
         pool.awaitTermination(durationMs + 15_000L, TimeUnit.MILLISECONDS);
         pool.shutdownNow();
 
-        // Flush remaining samples
-        if (!pendingInsert.isEmpty()) {
-            sampleRepository.saveAll(new ArrayList<>(pendingInsert));
-        }
-
+        if (!pendingInsert.isEmpty()) sampleRepository.saveAll(new ArrayList<>(pendingInsert));
         return allSamples;
     }
 
-    private PerformanceTestSample fireRequest(PerformanceTestRun run, int userId, int concurrentUsers) {
+    // ── Prerequisite execution ────────────────────────────────────────────────
+
+    /**
+     * Executes one prerequisite step for a virtual user.
+     * Returns captured field values extracted from the response.
+     * Latency is NOT recorded as a test sample — prereqs are setup cost, not what we're measuring.
+     */
+    private PrerequisiteResult runPrerequisite(PrerequisiteStep prereq, int userId,
+                                               Map<String, String> previousCaptures, Long ownerUserId) {
+        try {
+            com.example.perfservice.entity.PerformanceTestApi api =
+                    apiRepository.findByIdAndUserId(prereq.getApiId(), ownerUserId)
+                            .orElseThrow(() -> new IllegalArgumentException(
+                                    "Prerequisite API not found: " + prereq.getApiId()));
+
+            String url    = resolvePlaceholders(api.getUrl(), previousCaptures);
+            String method = api.getMethod().toUpperCase();
+
+            Request.Builder rb = new Request.Builder().url(url);
+
+            // Apply headers with placeholder resolution
+            if (api.getHeadersJson() != null && !api.getHeadersJson().isBlank()) {
+                try {
+                    Map<?, ?> headers = objectMapper.readValue(api.getHeadersJson(), Map.class);
+                    headers.forEach((k, v) -> rb.header(
+                            resolvePlaceholders(String.valueOf(k), previousCaptures),
+                            resolvePlaceholders(String.valueOf(v), previousCaptures)));
+                } catch (Exception ignored) {}
+            }
+
+            // Body — use payloadList round-robin if set, otherwise single body
+            String body = api.getBodyJson();
+            if (api.getPayloadListJson() != null && !api.getPayloadListJson().isBlank()) {
+                try {
+                    List<String> payloads = objectMapper.readValue(api.getPayloadListJson(),
+                            new com.fasterxml.jackson.core.type.TypeReference<List<String>>() {});
+                    if (!payloads.isEmpty()) body = payloads.get((userId - 1) % payloads.size());
+                } catch (Exception ignored) {}
+            }
+            body = body != null ? resolvePlaceholders(body, previousCaptures) : null;
+
+            RequestBody requestBody = null;
+            if (body != null && !body.isBlank() && !method.equals("GET")) {
+                requestBody = RequestBody.create(body, JSON_MEDIA);
+            }
+            rb.method(method, requestBody);
+
+            try (Response response = okHttpClient.newCall(rb.build()).execute()) {
+                if (!response.isSuccessful()) {
+                    String errBody = response.body() != null ? response.body().string() : "";
+                    return new PrerequisiteResult(false, Map.of(),
+                            "HTTP " + response.code() + ": " + errBody.substring(0, Math.min(200, errBody.length())));
+                }
+
+                String responseBody = response.body() != null ? response.body().string() : "";
+
+                // Extract captured fields using Jackson path traversal
+                Map<String, String> captures = new java.util.LinkedHashMap<>();
+                if (prereq.getCaptures() != null && !responseBody.isBlank()) {
+                    com.fasterxml.jackson.databind.JsonNode root = objectMapper.readTree(responseBody);
+                    for (PrerequisiteStep.FieldCapture capture : prereq.getCaptures()) {
+                        String value = resolveJsonPath(root, capture.getField());
+                        if (value != null) {
+                            captures.put(capture.getAs(), value);
+                            log.debug("[PerfTest] VU={} prereq='{}' captured {}={}...",
+                                    userId, prereq.getName(), capture.getAs(),
+                                    value.length() > 20 ? value.substring(0, 20) : value);
+                        } else {
+                            log.warn("[PerfTest] VU={} prereq='{}' field '{}' not found in response",
+                                    userId, prereq.getName(), capture.getField());
+                        }
+                    }
+                }
+                return new PrerequisiteResult(true, captures, null);
+            }
+        } catch (Exception e) {
+            return new PrerequisiteResult(false, Map.of(), e.getMessage());
+        }
+    }
+
+    /** Resolves {{PLACEHOLDER}} patterns in a string using the captures map. */
+    private String resolvePlaceholders(String template, Map<String, String> captures) {
+        if (template == null || captures.isEmpty()) return template;
+        String result = template;
+        for (Map.Entry<String, String> entry : captures.entrySet()) {
+            result = result.replace("{{" + entry.getKey() + "}}", entry.getValue());
+        }
+        return result;
+    }
+
+    /** Navigates a JSON node by dot-notation path. */
+    private String resolveJsonPath(com.fasterxml.jackson.databind.JsonNode root, String path) {
+        com.fasterxml.jackson.databind.JsonNode current = root;
+        for (String segment : path.split("\\.")) {
+            if (current == null || current.isNull()) return null;
+            current = current.isObject() ? current.get(segment) : null;
+        }
+        if (current == null || current.isNull()) return null;
+        return current.isValueNode() ? current.asText() : current.toString();
+    }
+
+    private record PrerequisiteResult(boolean success, Map<String, String> captures, String errorDetail) {}
+
+    private List<PrerequisiteStep> parsePrereqChain(String json) {
+        if (json == null || json.isBlank()) return List.of();
+        try {
+            return objectMapper.readValue(json,
+                    new com.fasterxml.jackson.core.type.TypeReference<List<PrerequisiteStep>>() {});
+        } catch (Exception e) {
+            log.warn("[PerfTest] Could not parse prerequisiteChainJson: {}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    private PerformanceTestSample fireRequest(PerformanceTestRun run, int userId,
+                                              int concurrentUsers, Map<String, String> captures) {
         long start = System.currentTimeMillis();
         PerformanceTestSample sample = new PerformanceTestSample();
         sample.setRunId(run.getId());
@@ -384,33 +530,33 @@ public class PerformanceTestService {
         sample.setConcurrentUsers(concurrentUsers);
 
         try {
-            Request.Builder rb = new Request.Builder().url(run.getResolvedUrl());
+            // Resolve {{PLACEHOLDER}} in URL using captures from prereq chain
+            String resolvedUrl = resolvePlaceholders(run.getResolvedUrl(), captures);
+            Request.Builder rb = new Request.Builder().url(resolvedUrl);
 
-            // Apply snapshotted headers
+            // Apply headers — resolve placeholders (e.g. Authorization: Bearer {{AUTH_TOKEN}})
             if (run.getResolvedHeadersJson() != null && !run.getResolvedHeadersJson().isBlank()) {
                 try {
                     Map<?, ?> headers = objectMapper.readValue(run.getResolvedHeadersJson(), Map.class);
-                    headers.forEach((k, v) -> rb.header(String.valueOf(k), String.valueOf(v)));
+                    headers.forEach((k, v) -> rb.header(
+                            resolvePlaceholders(String.valueOf(k), captures),
+                            resolvePlaceholders(String.valueOf(v), captures)));
                 } catch (Exception ignored) {}
             }
 
-            // Build body — round-robin from payloadList if present, otherwise single body.
-            // userId - 1 gives 0-based index; modulo cycles when payloads < users.
-            // e.g. 5 users, 2 payloads: user1→[0], user2→[1], user3→[0], user4→[1], user5→[0]
+            // Body — round-robin payload list, then resolve placeholders
             String method = run.getResolvedMethod().toUpperCase();
             String bodyToSend = run.getResolvedBodyJson();
             if (run.getPayloadListJson() != null && !run.getPayloadListJson().isBlank()) {
                 try {
-                    List<String> payloads = objectMapper.readValue(
-                            run.getPayloadListJson(),
+                    List<String> payloads = objectMapper.readValue(run.getPayloadListJson(),
                             new com.fasterxml.jackson.core.type.TypeReference<List<String>>() {});
-                    if (!payloads.isEmpty()) {
-                        bodyToSend = payloads.get((userId - 1) % payloads.size());
-                    }
+                    if (!payloads.isEmpty()) bodyToSend = payloads.get((userId - 1) % payloads.size());
                 } catch (Exception e) {
-                    log.warn("[PerfTest] Failed to parse payloadList for runId={}, using default body", run.getId());
+                    log.warn("[PerfTest] Failed to parse payloadList for runId={}", run.getId());
                 }
             }
+            bodyToSend = resolvePlaceholders(bodyToSend, captures);
 
             RequestBody requestBody = null;
             if (bodyToSend != null && !bodyToSend.isBlank() && !method.equals("GET")) {

@@ -1,6 +1,7 @@
 package com.example.perfservice.controller;
 
 import com.example.perfservice.dto.PerformanceTestApiRequest;
+import com.example.perfservice.dto.SingleRequestResult;
 import com.example.perfservice.entity.PerformanceTestApi;
 import com.example.perfservice.service.PerformanceTestApiService;
 import io.swagger.v3.oas.annotations.Operation;
@@ -82,6 +83,20 @@ public class PerformanceTestApiController {
      * Delete a saved API.
      * DELETE /performance/apis/{id}
      */
+    /**
+     * Fire one request against a saved API and return the raw response.
+     * No run created, no samples recorded — just a single HTTP call.
+     * Use this to discover field paths before writing capture definitions.
+     * POST /performance/apis/{id}/test
+     */
+    @PostMapping("/{id}/test")
+    @Operation(summary = "Test a saved API with one request",
+            description = "Fires a single HTTP request and returns the response body + status. " +
+                    "Use this to discover field paths for prerequisite captures before running a full test.")
+    public SingleRequestResult test(@PathVariable Long id) {
+        return apiService.testOne(id);
+    }
+
     @DeleteMapping("/{id}")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     @Operation(summary = "Delete a saved API config")

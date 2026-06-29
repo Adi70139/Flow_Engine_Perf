@@ -48,6 +48,20 @@ public class PerformanceTestApi {
     @Column(columnDefinition = "TEXT")
     private String payloadListJson;
 
+    // JSON array of prerequisite API steps, executed in order by each virtual user
+    // before the target request. Outputs captured from each step are injected into
+    // the next step and into the target request as {{placeholder}} values.
+    //
+    // Format: [{
+    //   "apiId": 1,                          // saved API to run as prereq
+    //   "name": "Login",                     // display name
+    //   "captures": [                        // fields to extract from response
+    //     { "field": "accessToken", "as": "AUTH_TOKEN" }
+    //   ]
+    // }]
+    @Column(columnDefinition = "TEXT")
+    private String prerequisiteChainJson;
+
     @Column(nullable = false, updatable = false)
     private LocalDateTime createdAt = LocalDateTime.now();
 

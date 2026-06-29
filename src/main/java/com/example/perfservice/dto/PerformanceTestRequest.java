@@ -26,6 +26,9 @@ public class PerformanceTestRequest {
     // Works with both apiId and inline. Overrides the saved API's payloadList if set here.
     private java.util.List<String> payloadList;
 
+    // Prerequisite chain — overrides the saved API's chain if provided
+    private java.util.List<PrerequisiteStep> prerequisiteChain;
+
     private String name; // label shown in history
 
     // ── Test type ─────────────────────────────────────────────────────────────

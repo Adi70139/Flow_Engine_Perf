@@ -5,6 +5,7 @@ import com.example.perfservice.dto.PerformanceTestRequest;
 import com.example.perfservice.entity.PerformanceTestRun;
 import com.example.perfservice.entity.PerformanceTestSample;
 import com.example.perfservice.service.PerformanceTestService;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
@@ -29,7 +30,7 @@ public class PerformanceTestController {
     @Operation(summary = "Start performance test",
             description = "LOAD | STRESS | SPIKE | SOAK. Returns runId immediately — " +
                     "subscribe to /{runId}/stream for real-time SSE progress.")
-    public PerformanceTestRun start(@Valid @RequestBody PerformanceTestRequest request) {
+    public PerformanceTestRun start(@Valid @RequestBody PerformanceTestRequest request) throws JsonProcessingException {
         return performanceTestService.start(request);
     }
 

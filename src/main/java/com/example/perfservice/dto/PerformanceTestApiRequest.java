@@ -29,4 +29,9 @@ public class PerformanceTestApiRequest {
     // Use this for endpoints where each user needs different data
     // (e.g. login with different credentials per user).
     private List<String> payloadList;
+
+    // Ordered list of prerequisite APIs to run before the target.
+    // Each virtual user runs these sequentially, captures specified fields,
+    // and injects them as {{PLACEHOLDER}} into the target request.
+    private List<PrerequisiteStep> prerequisiteChain;
 }
